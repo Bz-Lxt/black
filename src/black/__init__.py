@@ -1160,9 +1160,14 @@ def format_cell(src: str, *, fast: bool, mode: Mode) -> str:
     are currently not supported.
     """
     validate_cell(src, mode)
-    src_without_trailing_semicolon, has_trailing_semicolon = remove_trailing_semicolon(
-        src
-    )
+    try:
+        src_without_trailing_semicolon, has_trailing_semicolon = (
+            remove_trailing_semicolon(src)
+        )
+    except tokenize.TokenError:
+        # Invalid syntax can't be distinguished safely from unsupported
+        # magics, so leave such a cell untouched.
+        raise NothingChanged from None
     try:
         masked_src, replacements = mask_cell(src_without_trailing_semicolon)
     except SyntaxError:
@@ -1192,36 +1197,218 @@ def validate_metadata(nb: MutableMapping[str, Any]) -> None:
         raise NothingChanged from None
 
 
+def _parse_json_with_value_spans(
+    src_contents: str,
+) -> tuple[Any, list[tuple[int, int]]]:
+    """Parse JSON text while recording the span of every parsed value.
+
+    The spans are recorded in depth-first pre-order (the root value comes
+    first) and point at the exact ``(start, end)`` character offsets of each
+    value in *src_contents*. Only structural whitespace is skipped.
+    """
+    decoder = json.JSONDecoder()
+    # The scalar scanner is only ever called for a scalar value (containers
+    # are parsed below), so it never needs to recurse and the C accelerated
+    # scanner may safely be used when available.
+    scan_scalar = decoder.scan_once  # type: ignore[attr-defined]
+    parse_object = decoder.parse_object  # type: ignore[attr-defined]
+    parse_array = decoder.parse_array  # type: ignore[attr-defined]
+    spans: list[tuple[int, int]] = []
+
+    def scan(string: str, idx: int) -> tuple[Any, int]:
+        # Record the span before recursing so that spans end up in depth-first
+        # pre-order; fill in the end offset once the value is fully parsed.
+        slot = len(spans)
+        spans.append((idx, idx))
+        nextchar = string[idx]
+        if nextchar == "{":
+            value, end = parse_object(
+                (string, idx + 1),
+                decoder.strict,
+                scan,
+                decoder.object_hook,
+                decoder.object_pairs_hook,
+            )
+        elif nextchar == "[":
+            value, end = parse_array((string, idx + 1), scan)
+        else:
+            value, end = scan_scalar(string, idx)
+        spans[slot] = (idx, end)
+        return value, end
+
+    whitespace = re.compile(r"[ \t\n\r]*")
+    match = whitespace.match(src_contents)
+    assert match is not None
+    idx = match.end()
+    try:
+        nb, end = scan(src_contents, idx)
+    except StopIteration as err:
+        raise JSONDecodeError("Expecting value", src_contents, err.value) from None
+    trailing_whitespace = whitespace.match(src_contents, end)
+    assert trailing_whitespace is not None
+    end = trailing_whitespace.end()
+    if end != len(src_contents):
+        raise JSONDecodeError("Extra data", src_contents, end)
+    return nb, spans
+
+
+def _find_code_cell_source_spans(
+    nb: Any, spans: list[tuple[int, int]]
+) -> list[tuple[int, str | list[str], int, int]]:
+    """Pair parsed notebook values with their spans.
+
+    Return ``(cell_id, source, start, end)`` for the ``source`` value of every
+    code cell. Spans are consumed in the same depth-first order in which they
+    were recorded.
+    """
+    span_iter = iter(spans)
+    sources: list[tuple[int, str | list[str], int, int]] = []
+    consumed = 0
+
+    def visit(value: Any, path: tuple[Any, ...]) -> None:
+        nonlocal consumed
+        start, end = next(span_iter)
+        consumed += 1
+        if (
+            len(path) == 3
+            and path[0] == "cells"
+            and isinstance(path[1], int)
+            and path[2] == "source"
+            and isinstance(nb, dict)
+            and isinstance(nb.get("cells"), list)
+            and isinstance(nb["cells"][path[1]], dict)
+            and nb["cells"][path[1]].get("cell_type") == "code"
+        ):
+            sources.append((path[1], value, start, end))
+        if isinstance(value, dict):
+            for key, child in value.items():
+                visit(child, (*path, key))
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, (*path, index))
+
+    visit(nb, ())
+    if consumed != len(spans):
+        # More spans than parsed values can only happen with duplicate object
+        # keys (or an internal error); don't touch such a notebook.
+        raise NothingChanged
+    return sources
+
+
+def _detect_json_indent(src_contents: str) -> str:
+    """Best-effort detection of the indentation used in the notebook JSON."""
+    indents: list[str] = re.findall(r"(?m)^([ \t]+)\S", src_contents)
+    if not indents:
+        return " "
+    return min(indents, key=lambda indent: len(indent.expandtabs(8)))
+
+
+def _render_cell_source(
+    lines: list[str],
+    src_contents: str,
+    value_start: int,
+    value_end: int,
+    indent: str,
+    ensure_ascii: bool,
+) -> str:
+    """Serialize formatted cell source lines to JSON text.
+
+    The replacement mimics the indentation of the replaced value so that no
+    surrounding text has to change.
+    """
+    line_start = src_contents.rfind("\n", 0, value_start) + 1
+    line_prefix = src_contents[line_start:value_start]
+    # The indentation is only meaningful when the ``"source"`` key is the
+    # first non-whitespace token on its line (an inline value spans a line
+    # that already contains other JSON tokens).
+    if line_prefix.lstrip(" \t").startswith('"'):
+        leading_whitespace = len(line_prefix) - len(line_prefix.lstrip(" \t"))
+        key_indent = line_prefix[:leading_whitespace]
+    else:
+        key_indent = ""
+
+    # Prefer the indentation of the original array if it is multiline.
+    token = src_contents[value_start:value_end]
+    match = re.search(r"\n([ \t]+)\S", token)
+    if match and match.group(1).startswith(key_indent):
+        item_indent = match.group(1)
+        if len(item_indent) > len(key_indent):
+            indent = item_indent[len(key_indent) :]
+
+    rendered = str(json.dumps(lines, indent=indent, ensure_ascii=ensure_ascii))
+    parts = rendered.split("\n")
+    if len(parts) == 1:
+        # An empty list is always rendered inline as ``[]``.
+        return rendered
+
+    # Keep the structural newline style of the original document.
+    newline = "\r\n" if "\r\n" in src_contents else "\n"
+    return (
+        parts[0]
+        + newline
+        + newline.join(key_indent + part for part in parts[1:-1])
+        + newline
+        + key_indent
+        + parts[-1]
+    )
+
+
 def format_ipynb_string(src_contents: str, *, fast: bool, mode: Mode) -> FileContent:
     """Format Jupyter notebook.
 
     Operate cell-by-cell, only on code cells, only for Python notebooks.
-    If the ``.ipynb`` originally had a trailing newline, it'll be preserved.
+    Only the JSON text of a reformatted cell ``source`` is replaced; the rest
+    of the document (including its whitespace, newline style and character
+    escaping) is left byte-for-byte untouched.
     """
     if not src_contents:
         raise NothingChanged
 
-    trailing_newline = src_contents[-1] == "\n"
-    modified = False
-    nb = json.loads(src_contents)
-    validate_metadata(nb)
-    for cell in nb["cells"]:
-        if cell.get("cell_type", None) == "code":
-            try:
-                src = "".join(cell["source"])
-                dst = format_cell(src, fast=fast, mode=mode)
-            except NothingChanged:
-                pass
-            else:
-                cell["source"] = dst.splitlines(keepends=True)
-                modified = True
-    if modified:
-        dst_contents = json.dumps(nb, indent=1, ensure_ascii=False)
-        if trailing_newline:
-            dst_contents = dst_contents + "\n"
-        return dst_contents
-    else:
+    nb, spans = _parse_json_with_value_spans(src_contents)
+    if not isinstance(nb, dict) or not isinstance(nb.get("cells"), list):
         raise NothingChanged
+    validate_metadata(nb)
+
+    # Match the escaping used in the original document: files written with
+    # ``ensure_ascii=False`` contain raw non-ASCII characters, everything else
+    # keeps its ``\\uXXXX`` escapes.
+    ensure_ascii = src_contents.isascii()
+    indent = _detect_json_indent(src_contents)
+
+    replacements: list[tuple[int, int, str]] = []
+    cell_sources = _find_code_cell_source_spans(nb, spans)
+    for _, source, value_start, value_end in cell_sources:
+        if isinstance(source, str):
+            src = source
+        elif isinstance(source, list) and all(isinstance(line, str) for line in source):
+            src = "".join(source)
+        else:
+            continue
+        try:
+            dst = format_cell(src, fast=fast, mode=mode)
+        except NothingChanged:
+            continue
+        new_source = _render_cell_source(
+            dst.splitlines(keepends=True),
+            src_contents,
+            value_start,
+            value_end,
+            indent,
+            ensure_ascii,
+        )
+        if new_source != src_contents[value_start:value_end]:
+            replacements.append((value_start, value_end, new_source))
+
+    if not replacements:
+        raise NothingChanged
+
+    # Splice from the end so earlier offsets stay valid.
+    dst_contents = src_contents
+    for value_start, value_end, new_source in reversed(replacements):
+        dst_contents = (
+            dst_contents[:value_start] + new_source + dst_contents[value_end:]
+        )
+    return dst_contents
 
 
 def format_str(

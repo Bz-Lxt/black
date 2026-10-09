@@ -1,4 +1,5 @@
 import contextlib
+import json
 import pathlib
 import re
 from contextlib import AbstractContextManager
@@ -438,6 +439,174 @@ def test_entire_notebook_without_changes() -> None:
     content = read_jupyter_notebook("jupyter", "notebook_without_changes")
     with pytest.raises(NothingChanged):
         format_file_contents(content, fast=True, mode=JUPYTER_MODE)
+
+
+def test_only_reformatted_cells_change() -> None:
+    # Everything outside the reformatted cell (non-canonical indentation,
+    # compact containers, ASCII escapes, missing trailing newline) is kept
+    # byte-for-byte.
+    content = (
+        "{\n"
+        '  "cells": [\n'
+        "    {\n"
+        '      "cell_type": "code",\n'
+        '      "execution_count": null,\n'
+        '      "metadata": {},\n'
+        '      "outputs": [],\n'
+        '      "source": [\n'
+        '        "x=1"\n'
+        "      ]\n"
+        "    },\n"
+        "    {\n"
+        '      "cell_type": "markdown",\n'
+        '      "metadata": {},\n'
+        '      "source": ["# H\\u00e9"]\n'
+        "    }\n"
+        "  ],\n"
+        '  "metadata": {"k": "\\u00f6"},\n'
+        '  "nbformat": 4,\n'
+        '  "nbformat_minor": 5\n'
+        "}"
+    )
+    expected = content.replace('"x=1"', '"x = 1"')
+    result = format_file_contents(content, fast=True, mode=JUPYTER_MODE)
+    assert result == expected
+
+
+def test_formatting_notebook_is_idempotent() -> None:
+    content = (
+        "{\n"
+        '  "cells": [\n'
+        "    {\n"
+        '      "cell_type": "code",\n'
+        '      "execution_count": null,\n'
+        '      "metadata": {},\n'
+        '      "outputs": [],\n'
+        '      "source": [\n'
+        '        "x=1"\n'
+        "      ]\n"
+        "    }\n"
+        "  ],\n"
+        '  "metadata": {"k": "\\u00f6"},\n'
+        '  "nbformat": 4,\n'
+        '  "nbformat_minor": 5\n'
+        "}"
+    )
+    result = format_file_contents(content, fast=True, mode=JUPYTER_MODE)
+    with pytest.raises(NothingChanged):
+        format_file_contents(result, fast=True, mode=JUPYTER_MODE)
+
+
+def test_ascii_escaping_is_preserved() -> None:
+    # A pure-ASCII notebook stores non-ASCII characters as \uXXXX escapes;
+    # a reformatted cell must keep using the same escaping.
+    content = (
+        "{\n"
+        ' "cells": [\n'
+        "  {\n"
+        '   "cell_type": "code",\n'
+        '   "execution_count": null,\n'
+        '   "metadata": {},\n'
+        '   "outputs": [],\n'
+        '   "source": [\n'
+        "    \"x='\\u00e9'\\n\"\n"
+        "   ]\n"
+        "  }\n"
+        " ],\n"
+        ' "metadata": {},\n'
+        ' "nbformat": 4,\n'
+        ' "nbformat_minor": 4\n'
+        "}\n"
+    )
+    result = format_file_contents(content, fast=True, mode=JUPYTER_MODE)
+    assert '"x = \\"\\u00e9\\""' in result
+    assert result.isascii()
+
+
+def test_line_endings_are_preserved() -> None:
+    content = (
+        "{\r\n"
+        ' "cells": [\r\n'
+        "  {\r\n"
+        '   "cell_type": "code",\r\n'
+        '   "execution_count": null,\r\n'
+        '   "metadata": {},\r\n'
+        '   "outputs": [],\r\n'
+        '   "source": [\r\n'
+        '    "x=1\\n"\r\n'
+        "   ]\r\n"
+        "  }\r\n"
+        " ],\r\n"
+        ' "metadata": {},\r\n'
+        ' "nbformat": 4,\r\n'
+        ' "nbformat_minor": 4\r\n'
+        "}\r\n"
+    )
+    result = format_file_contents(content, fast=True, mode=JUPYTER_MODE)
+    assert '[\r\n    "x = 1"\r\n   ]' in result
+    assert "\n" not in result.replace("\r\n", "")
+    with pytest.raises(NothingChanged):
+        format_file_contents(result, fast=True, mode=JUPYTER_MODE)
+
+
+def test_source_as_single_string() -> None:
+    # nbformat also allows ``source`` to be a plain string instead of a list.
+    content = (
+        "{\n"
+        ' "cells": [\n'
+        "  {\n"
+        '   "cell_type": "code",\n'
+        '   "execution_count": null,\n'
+        '   "metadata": {},\n'
+        '   "outputs": [],\n'
+        '   "source": "x=1\\n"\n'
+        "  }\n"
+        " ],\n"
+        ' "metadata": {},\n'
+        ' "nbformat": 4,\n'
+        ' "nbformat_minor": 4\n'
+        "}"
+    )
+    result = format_file_contents(content, fast=True, mode=JUPYTER_MODE)
+    result_nb = json.loads(result)
+    assert result_nb["cells"][0]["source"] == ["x = 1"]
+    with pytest.raises(NothingChanged):
+        format_file_contents(result, fast=True, mode=JUPYTER_MODE)
+
+
+def test_unparseable_cell_does_not_change_other_cells() -> None:
+    # A cell that cannot be tokenized is left untouched, while other cells
+    # are still reformatted.
+    content = (
+        "{\n"
+        ' "cells": [\n'
+        "  {\n"
+        '   "cell_type": "code",\n'
+        '   "execution_count": null,\n'
+        '   "metadata": {},\n'
+        '   "outputs": [],\n'
+        '   "source": [\n'
+        '    "def bad(:\\n"\n'
+        "   ]\n"
+        "  },\n"
+        "  {\n"
+        '   "cell_type": "code",\n'
+        '   "execution_count": null,\n'
+        '   "metadata": {},\n'
+        '   "outputs": [],\n'
+        '   "source": [\n'
+        '    "y =2\\n"\n'
+        "   ]\n"
+        "  }\n"
+        " ],\n"
+        ' "metadata": {},\n'
+        ' "nbformat": 4,\n'
+        ' "nbformat_minor": 4\n'
+        "}\n"
+    )
+    result = format_file_contents(content, fast=True, mode=JUPYTER_MODE)
+    assert '"def bad(:\\n"' in result
+    assert '"y = 2"' in result
 
 
 def test_non_python_notebook() -> None:

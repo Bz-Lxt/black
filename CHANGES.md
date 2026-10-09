@@ -209,6 +209,13 @@
 
 <!-- For example, Docker, GitHub Actions, pre-commit, editors -->
 
+### Jupyter Notebook support
+
+- Formatting a notebook now only rewrites the code cells that actually change;
+  all other JSON text (including indentation, line endings and `\uXXXX`
+  escaping) is preserved byte-for-byte. Cells that can't be parsed are left
+  untouched and the result is stable across repeated runs
+
 ### Documentation
 
 <!-- Major changes to documentation and policies. Small docs changes
